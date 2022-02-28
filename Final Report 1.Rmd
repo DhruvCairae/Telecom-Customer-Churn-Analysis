@@ -1,0 +1,343 @@
+---
+title: "Telecom Data Chrun Analysis"
+author: "Dhruv Cairae & Others"
+date: "2/24/2022"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+## Overview
+
+For this project our team decided to look at customer data to preform logistic regression. Our data set concerns customer retention data and our dependent variable is a dummy variable of whether a customer is retained. In this report we will be going through our data (including visualizations),  exploratory data analysis, model building, and conclusions.
+
+## The Data
+
+The data selected for this project is a data set from kaggle called ["Telco Customer Churn"](https://www.kaggle.com/blastchar/telco-customer-churn/version/1). It is originally an IBM sample data set. As stated in the overview the data is concerned with whether customers are retained, this variable is a dummy variable called churn. Churn takes a value of 1 if the customer churned (left) or 0 if the customer is retained. The data set contains 19 more predictor varibles and a identification column. The predictor varibles fall into three broad categories: services each customer has, customer account information, and customer demographics. These variables will be explored in greater depth below.
+
+# Exploratory Data Analysis
+
+## Initial Wrangling
+
+In this section of the report we will be exploring and explaining the data.
+
+```{r, results='hide', message=FALSE,warning=FALSE}
+# load necessary packages
+library(dplyr)
+library(tidyverse)
+library(fastDummies)
+library(skimr)
+library(lares)
+library(caTools)
+library(caret)
+```
+```{r}
+# read in the data
+file<-read.csv("C:/Users/Dhruv Cairae/Desktop/WA_Fn-UseC_-Telco-Customer-Churn.csv",header=T) # reads in the data using read.csv()
+summary(file) # summary Statistics
+str(file) # simple structure
+head(file) # first 6 rows
+```
+
+Based on the summary, head, and structure functions we can see that most of the data is numerical or character. We can see that many of the character variables appear to actually be categorical (we will need to transform these) and we also need to check for missing values.
+
+```{r}
+table(is.na(file)) # check for missing values in the data frame
+
+```
+
+Our table of missing values shows that only 11 are missing out of nearly 150,000 data points. This is negligible and should not interfere with our model.  Based on the data dictionary we have access to we know that the customerID variable is unique for every row. Our next step is to remove this from our data set.
+
+```{r}
+file_1<-file[-c(1)] # dataframe of the last column
+file_2<-na.omit(file_1) # dataframe of everything except the last column
+```
+
+Now that we have removed our first column, the next step is to transform the character variables into factors. This will make it easier to preform our logistic regression in the model building section, the numeric variables are left alone.
+
+```{r}
+file_3 <- dummy_cols(file_2, select_columns = c('gender','Partner','Dependents','PhoneService','MultipleLines',
+                                              'InternetService','OnlineSecurity','OnlineBackup','DeviceProtection',
+                                              'TechSupport','StreamingTV','StreamingMovies',
+                                              'PaperlessBilling'),remove_selected_columns = TRUE) # creates factors of variables
+```
+
+After transforming these variables to factors, we further transform some of these into dummy variables to make our analysis easier and remove unecessary variables.
+
+```{r}
+dataset<-subset(file_3,select = c(SeniorCitizen,tenure,MonthlyCharges,TotalCharges,gender_Male,Partner_Yes,Dependents_Yes,
+                                 PhoneService_Yes,MultipleLines_Yes,InternetService_DSL,InternetService_No,OnlineSecurity_Yes,OnlineBackup_Yes,DeviceProtection_Yes,TechSupport_Yes,StreamingTV_Yes,
+                                 StreamingMovies_Yes,PaperlessBilling_Yes)) # subset of only necessary data
+```
+```{r}
+dataset$creditcard<- ifelse(file_3$PaymentMethod=="Credit card (automatic)", 1, 0)  # Creates new columns using ifelse()                          
+dataset$banktransfer<- ifelse(file_3$PaymentMethod=="Bank transfer (automatic)", 1, 0)
+dataset$ec<- ifelse(file_3$PaymentMethod=="Electronic check", 1, 0)
+dataset$monthlycontract<- ifelse(file_3$Contract=="Month-to-month", 1, 0)
+dataset$annual<- ifelse(file_3$Contract=="One year", 1, 0)
+dataset$Churn_Yes<- ifelse(file_3$Churn=="Yes", 1, 0)
+skim(dataset) # summary statistics similar to summary()
+```
+
+The summary of our new data set demonstrates how our transformations have affected our original data. This summary can be compared to the summary created in the first part of this section.
+
+# Initial Model Building
+
+## Correlation Analysis & Visualizations of top 3 Variables of Interest
+
+We preform a correlation analysis to get the top 10 correlated values from there we will narrow it down to the top 3 variables of interest.
+
+```{r}
+corr_var(dataset, # name of dataset
+         Churn_Yes, # name of variable to focus on
+         top = 10 # display top 10 correlations
+) # correlation analysis
+
+```
+
+Based on the correlation analysis the most important variables in relation to churn_yes (the customer has churned) are monthlycontract (the customers contract is month to month), tenure (The number of months the customer has stayed with the company), and ec (the customer pays with an electric check). EC and monthlycontract are highly positively correlated while tenure is highly negatively correlated. This makes logical sense for the tenure variable, the longer you are with the company the less likely you are to leave. We have graphed the three most important variables to make viewing them easier.
+
+```{r}
+hist(file$tenure,main="Histogram of Tenure",freq = FALSE) #histogram of tenure
+lines(density(file$tenure), lwd=5, col='blue') 
+
+ggplot(file, aes(x = Churn)) + #ggplot of churn
+  geom_bar(fill=c('green','red'))+
+  theme_minimal()+
+  ggtitle("Plot of Churn")+
+  labs(x = "Churn", y = "Count")
+
+ggplot(file, aes(x = Churn,fill=Contract)) + # ggplot of churn by contracts
+  geom_bar()+
+  ggtitle("Plot of Churn by Contracts")+
+  theme_minimal()+
+  labs(x = "Churn")
+
+
+ggplot(file, aes(x = Churn,fill=PaymentMethod)) + # ggplot of churn by payment method
+  geom_bar()+
+  ggtitle("Plot of Churn by Payment Method")+
+  theme_minimal()+
+  labs(x = "Churn")
+```
+
+## Model Development
+
+In this section we will be developing a model to predict whether a customer leaves the company or not. First we split the data into training and testing sets. Then we fit XGBoost to the training set and use K-fold cross validation to validate our predicted results.
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(100)
+split = sample.split(dataset$Churn_Yes, SplitRatio = 0.8) # create testing and training datasets
+training_set = subset(dataset, split == TRUE)
+test_set = subset(dataset, split == FALSE)
+
+# Fitting XGBoost to the Training set & K-Fold Cross Validation
+library(xgboost)
+classifier = xgboost(data = as.matrix(training_set[-24]), label = training_set$Churn_Yes, nrounds = 10)
+
+# Predicting the Test set results
+y_pred = predict(classifier, newdata = as.matrix(test_set[-24]))
+y_pred = (y_pred >= 0.5)
+cm = table(test_set[, 24], y_pred)
+cm
+library(caret)
+folds = createFolds(training_set$Churn_Yes, k = 5)
+cv = lapply(folds, function(x) {
+  training_fold = training_set[-x, ]
+  test_fold = training_set[x, ]
+  classifier = xgboost(data = as.matrix(training_fold[-24]), label = training_fold$Churn_Yes, nrounds = 5)
+  y_pred = predict(classifier, newdata = as.matrix(test_fold[-24]))
+  y_pred = (y_pred >= 0.5)
+  cm = table(test_fold[, 24], y_pred)
+  accuracy = (cm[1,1] + cm[2,2]) / (cm[1,1] + cm[2,2] + cm[1,2] + cm[2,1])
+  return(accuracy)
+})
+accuracy = mean(as.numeric(cv))
+accuracy
+```
+
+Based on the test results table and the accuracy measurement this appears to be an excellent model for our predictive purposes.
+
+## Another modeling attempt using glm (Logistic Regression)
+ 
+In this section we will test different glm models using the full model, the null model, the model using the 3 predictor variables from the previous section, stepwise AIC, and stepwise BIC.
+
+```{r, message=FALSE, warning=FALSE}
+## glm Model on all variables
+full_model <- glm(Churn_Yes ~ ., family = binomial, data = training_set)
+full_model_summary <- summary(full_model)
+
+full_model_summary$deviance/full_model_summary$df.residual # in-sample model mean residual deviance
+AIC(full_model) #AIC
+BIC(full_model) #BIC
+
+## glm Model on no variables
+null_model <- glm(Churn_Yes ~ 1, family = binomial, data = training_set)
+null_model_summary <- summary(null_model)
+
+null_model_summary$deviance/null_model_summary$df.residual # in-sample model mean residual deviance
+AIC(null_model)
+BIC(null_model)
+
+## glm Model on Education and PAY_0 variables
+glm_model <- glm(Churn_Yes ~monthlycontract+tenure+ec, family = binomial, data = training_set)
+glm_model_summary <- summary(glm_model)
+
+glm_model_summary$deviance/glm_model_summary$df.residual # in-sample model mean residual deviance
+AIC(glm_model)
+BIC(glm_model)
+
+glm_model_summary$df.residual
+```
+```{r, message=FALSE, echo=FALSE}
+## Stepwise (AIC)
+AIC_step <- step(full_model,data=training_set) #k=2, default AIC
+```
+```{r, message=FALSE}
+AIC_step_summary <- summary(AIC_step)
+
+AIC_step_summary$deviance/AIC_step_summary$df.residual
+AIC(AIC_step)
+BIC(AIC_step)
+
+## Stepwise (BIC)
+n <- dim(training_set)[1]
+```
+```{r, message=FALSE, echo=FALSE}
+BIC_step <- step(full_model,data=training_set,k=log(n)) #k=ln(n), BIC
+```
+```{r, message=FALSE}
+BIC_step_summary <- summary(BIC_step)
+BIC_step_summary$deviance/BIC_step_summary$df.residual
+AIC(BIC_step)
+BIC(BIC_step)
+
+
+```
+
+Based on the various general linear model (logistic) the step wise AIC performs the best in terms of MSE, AIC, and BIC criteria. The stepwise AIC chose the following variables to be included in the final logistic model:SeniorCitizen + tenure + MonthlyCharges + TotalCharges + Dependents_Yes + MultipleLines_Yes + InternetService_DSL + InternetService_No + OnlineSecurity_Yes + TechSupport_Yes + StreamingTV_Yes + StreamingMovies_Yes + PaperlessBilling_Yes + ec + monthlycontract + annual. We will test this model to see if it is more accurate then the model produced earlier.
+
+## Testing the best model from the logistic regression
+
+### ROC, AUC, and Asymmetric Cost of the Stepwise AIC model 
+
+```{r}
+# ROC curve, in sample prediction
+AIC_step_train<- predict(AIC_step, type="response")
+
+# ROC Curve
+library(ROCR)
+pred <- prediction(AIC_step_train, training_set$Churn_Yes)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, colorize=TRUE, main = "ROC Plot Training Data")
+
+#Get the AUC
+unlist(slot(performance(pred, "auc"), "y.values"))
+
+# 2X2 misclassification table
+pred_resp <- predict(AIC_step,type="response")
+hist(pred_resp)
+
+table(training_set$Churn_Yes, (pred_resp > 0.5)*1, dnn=c("Truth","Predicted"))
+
+## Symetric cost (misclassification rate) function
+pcut <- 1/2 #prespecify pcut value
+cost1 <- function(r, pi){
+  mean(((r==0)&(pi>pcut)) | ((r==1)&(pi<pcut)))
+}
+
+#Symmetric cost
+cost1(r = training_set$Churn_Yes, pi = AIC_step_train)
+```
+
+The AUC and cost show that this is an effective determiner of whether a customer is retained. It is more effective than the model created earlier and just guessing based on percentage of churn_yes = 1.
+
+Now we have confirmed the stepwise AIC performs well on the training data, we must now confirm using the testing data set.
+
+```{r}
+# Out-of-sample Testing 
+AIC_step_test<- predict(AIC_step, newdata = test_set, type="response")
+
+# Get ROC curve
+pred <- prediction(AIC_step_test, test_set$Churn_Yes)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, colorize=TRUE, main = "ROC Plot Testing Data")
+
+#Get the AUC
+unlist(slot(performance(pred, "auc"), "y.values"))
+
+#Asymmetric cost
+cost1(r = test_set$Churn_Yes, pi = AIC_step_test)
+```
+
+The AUC and cost are close to the results from the training set and they are good enough to show this is an effective model.
+
+Next we use cross validation using AUC as cost.
+
+```{r, message=FALSE,message=FALSE}
+#AUC as cost
+costfunc1 = function(obs, pred.p){
+  pred <- prediction(pred.p, obs)
+  perf <- performance(pred, "tpr", "fpr")
+  cost =unlist(slot(performance(pred, "auc"), "y.values"))
+  return(cost)
+} 
+
+library(boot)
+library(ROCR)
+
+## Attempt using glm set to stepwise
+glm1<- glm(Churn_Yes~SeniorCitizen + tenure + MonthlyCharges + TotalCharges + Dependents_Yes + MultipleLines_Yes + InternetService_DSL + InternetService_No + OnlineSecurity_Yes + TechSupport_Yes + StreamingTV_Yes + StreamingMovies_Yes + PaperlessBilling_Yes + ec + monthlycontract + annual, family=binomial, data=dataset);  
+cv_result  <- cv.glm(data=dataset, glmfit=glm1, cost=costfunc1, K=10) 
+cv_result$delta[2]
+
+```
+
+The cross validation confirms the strong results above.
+
+
+# Conclusion
+
+This project showed the process of importing Telco customer data, performing exploratory data analysis, fitting a variety of models, and then comparing said models to determine best fit. Key indicators like monthly contract and tenure were explained as logically becoming important features. Models included XGBoost and GLM, with stepwise AIC being the best GLM model on multiple metrics, surprassing XGBoost. This model had high AUC (> 0.7) and low symmetric cost, and was further confirmed in cross-validation.
+
+
+# Appendix
+
+* xgboost()
+XGboost stands for Xtreme Gradient Boosting, and is a machine-learning model that creates decision trees and then prunes them in iterations until reaching a stopping point. XGboost's power comes from its ability to generate trees much more quickly than a human could, allowing for the machine to continuously decrease prediction error until a stopping condition is reached. 
+*dummy_cols()
+*subset()
+*skim()
+*corr_var()
+*xgboost()
+*as.matrix()
+*createfolds()
+*lapply()
+*AIC()
+*BIC()
+*step()
+*performance()
+*unlist()
+*cv.glm()
+
+## Functions used that were covered in class
+
+* c()
+* ggplot()
+* summary()
+* str()
+* aes()
+* function()
+* ifelse()
+* set.seed()
+* hist()
+* predict()
+* table()
+* head()
+* is.na()
+* glm()
